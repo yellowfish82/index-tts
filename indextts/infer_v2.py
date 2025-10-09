@@ -151,10 +151,23 @@ class IndexTTS2:
 
         bigvgan_name = self.cfg.vocoder.name
         self.bigvgan = bigvgan.BigVGAN.from_pretrained(bigvgan_name, use_cuda_kernel=self.use_cuda_kernel)
-        self.bigvgan = self.bigvgan.to(self.device)
+        
+        # 【内存优化】：支持通过环境变量指定 BigVGAN 设备
+        # 对于小内存 GPU，可以将 BigVGAN 直接加载到 CPU 以避免 OOM
+        bigvgan_device = os.environ.get("INDEXTTS_BIGVGAN_DEVICE", None)
+        if bigvgan_device == "cpu":
+            print(f"[优化] 根据环境变量 INDEXTTS_BIGVGAN_DEVICE，将 BigVGAN 加载到 CPU")
+            self.bigvgan = self.bigvgan.to("cpu")
+        else:
+            self.bigvgan = self.bigvgan.to(self.device)
+        
         self.bigvgan.remove_weight_norm()
         self.bigvgan.eval()
         print(">> bigvgan weights restored from:", bigvgan_name)
+        
+        # 显示 BigVGAN 实际所在设备
+        actual_device = next(self.bigvgan.parameters()).device
+        print(f">> bigvgan device: {actual_device}")
 
         self.bpe_path = os.path.join(self.model_dir, self.cfg.dataset["bpe_model"])
         self.normalizer = TextNormalizer()
@@ -443,7 +456,7 @@ class IndexTTS2:
         Inference using a precomputed speaker bundle (pt file).
         Supports output as WAV or MP3 based on output_path extension.
         """
-        print(">> starting inference with PT bundle...")
+        print(f">> starting inference with PT bundle... stream_return={stream_return}")
         self._set_gr_progress(0, "starting inference...")
         
         if verbose:
@@ -564,6 +577,11 @@ class IndexTTS2:
         has_warned = False
         silence = None  # for stream_return
         
+        # 【内存优化】：在推理循环开始前清理 GPU 缓存
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            gc.collect()
+        
         for seg_idx, sent in enumerate(segments):
             self._set_gr_progress(0.2 + 0.7 * seg_idx / segments_count,
                                   f"speech synthesis {seg_idx + 1}/{segments_count}...")
@@ -592,6 +610,7 @@ class IndexTTS2:
                         emovec = emovec_mat + (1 - torch.sum(weight_vector)) * emovec
                         # emovec = emovec_mat
 
+                    print(f"[DEBUG] seg_idx={seg_idx}, 调用 inference_speech 参数: num_beams={num_beams}, num_return_sequences={autoregressive_batch_size}, max_generate_length={max_mel_tokens}")
                     codes, speech_conditioning_latent = self.gpt.inference_speech(
                         spk_cond_emb,
                         text_tokens,
@@ -610,6 +629,7 @@ class IndexTTS2:
                         max_generate_length=max_mel_tokens,
                         **generation_kwargs
                     )
+                    print(f"[DEBUG] seg_idx={seg_idx}, inference_speech 返回 codes.shape: {codes.shape}")
 
                 gpt_gen_time += time.perf_counter() - m_start_time
                 if not has_warned and (codes[:, -1] != self.stop_mel_token).any():
@@ -622,10 +642,10 @@ class IndexTTS2:
                     has_warned = True
 
                 # 使用和infer_generator相同的codes长度处理逻辑
+                print(f"[DEBUG] seg_idx={seg_idx}, codes.shape before processing: {codes.shape}")
                 code_lens = []
                 for code in codes:
                     if self.stop_mel_token not in code:
-                        code_lens.append(len(code))
                         code_len = len(code)
                     else:
                         len_ = (code == self.stop_mel_token).nonzero(as_tuple=False)[0] + 1
@@ -634,6 +654,7 @@ class IndexTTS2:
                 codes = codes[:, :code_len]
                 code_lens = torch.LongTensor(code_lens)
                 code_lens = code_lens.to(self.device)
+                print(f"[DEBUG] seg_idx={seg_idx}, code_lens: {code_lens}, len={len(code_lens)}")
                 if verbose:
                     print(codes, type(codes))
                     print(f"fix codes shape: {codes.shape}, codes type: {codes.dtype}")
@@ -659,7 +680,17 @@ class IndexTTS2:
                 dtype = None
                 with torch.amp.autocast(text_tokens.device.type, enabled=dtype is not None, dtype=dtype):
                     m_start_time = time.perf_counter()
-                    diffusion_steps = 25
+                    
+                    # 【内存优化】：小内存 GPU 使用更少的 diffusion steps
+                    if torch.cuda.is_available():
+                        total_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+                        if total_mem < 10:
+                            diffusion_steps = 15  # 减少步数以降低峰值内存
+                        else:
+                            diffusion_steps = 25
+                    else:
+                        diffusion_steps = 25
+                    
                     inference_cfg_rate = 0.7
                     latent = self.s2mel.models['gpt_layer'](latent)
                     # 使用和infer_generator相同的semantic_codec调用
@@ -672,6 +703,10 @@ class IndexTTS2:
                                                                  ylens=target_lengths,
                                                                  n_quantizers=3,
                                                                  f0=None)[0]
+                    # 调试：打印维度以排查 tensor 不匹配问题
+                    if prompt_condition.shape[0] != cond.shape[0]:
+                        print(f"[ERROR] prompt_condition shape[0]={prompt_condition.shape[0]} != cond shape[0]={cond.shape[0]}")
+                    print(f"[DEBUG] prompt_condition.shape={prompt_condition.shape}, cond.shape={cond.shape}")
                     cat_condition = torch.cat([prompt_condition, cond], dim=1)
                     vc_target = self.s2mel.models['cfm'].inference(cat_condition,
                                                                    torch.LongTensor([cat_condition.size(1)]).to(
@@ -682,7 +717,11 @@ class IndexTTS2:
                     s2mel_time += time.perf_counter() - m_start_time
 
                     m_start_time = time.perf_counter()
-                    wav = self.bigvgan(vc_target.float()).squeeze().unsqueeze(0)
+                    # 设备自适应：确保输入数据和 bigvgan 模型在同一设备上
+                    # 这样无论 bigvgan 在 GPU 还是 CPU，都能正常工作
+                    bigvgan_device = next(self.bigvgan.parameters()).device
+                    vc_target_input = vc_target.float().to(bigvgan_device)
+                    wav = self.bigvgan(vc_target_input).squeeze().unsqueeze(0)
                     print(wav.shape)
                     bigvgan_time += time.perf_counter() - m_start_time
                     wav = wav.squeeze(1)
@@ -690,8 +729,25 @@ class IndexTTS2:
                 wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
                 if verbose:
                     print(f"wav shape: {wav.shape}", "min:", wav.min(), "max:", wav.max())
+                
+                # 【修复】确保 wav 是 [1, samples] 形状（单声道）
+                # 如果是 [channels, samples]，只取第一个声道
+                if wav.dim() == 2 and wav.shape[0] > 1:
+                    print(f"[WARNING] wav 有 {wav.shape[0]} 个声道，只保留第一个声道")
+                    wav = wav[0:1, :]  # 保持 [1, samples] 形状
+                elif wav.dim() == 1:
+                    wav = wav.unsqueeze(0)  # [samples] -> [1, samples]
+                
+                # 调试：打印每个 wav 的维度
+                print(f"[DEBUG] segment {seg_idx} wav shape after normalization: {wav.shape}")
+                
                 # wavs.append(wav[:, :-512])
                 wavs.append(wav.cpu())  # to cpu before saving
+                
+                # 【内存优化】：每个 segment 生成后立即清理 GPU 缓存，释放中间张量占用的内存
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
                 if stream_return:
                     yield wav.cpu()
                     if silence == None:
@@ -699,8 +755,21 @@ class IndexTTS2:
                     yield silence
         end_time = time.perf_counter()
 
+        # 【修复】：如果是流式返回，在循环结束后直接 return，不需要执行后面的拼接和保存逻辑
+        print(f"[DEBUG] 循环结束，stream_return={stream_return}, wavs 数量={len(wavs)}")
+        if stream_return:
+            print(f"[STREAM] 流式生成完成，总计生成 {len(wavs)} 个音频段")
+            print(f">> Total inference time: {end_time - start_time:.2f} seconds")
+            return None
+
         self._set_gr_progress(0.9, "saving audio...")
         wavs = self.insert_interval_silence(wavs, sampling_rate=sampling_rate, interval_silence=interval_silence)
+        
+        # 调试：打印所有 tensor 的维度
+        print(f"[DEBUG] Concatenating {len(wavs)} tensors:")
+        for i, w in enumerate(wavs):
+            print(f"  tensor {i}: shape = {w.shape}")
+        
         wav = torch.cat(wavs, dim=1)
         wav_length = wav.shape[-1] / sampling_rate
         print(f">> gpt_gen_time: {gpt_gen_time:.2f} seconds")
