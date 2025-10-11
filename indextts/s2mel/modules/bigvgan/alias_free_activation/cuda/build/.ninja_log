@@ -1,0 +1,4 @@
+# ninja log v7
+0	9344	1759399178370019669	anti_alias_activation.o	9dc42e39254ae009
+0	89295	1759399178370019669	anti_alias_activation_cuda.cuda.o	9afe56407cd0f5c
+89298	89446	1759399267668221829	anti_alias_activation_cuda.so	d87514d2df16b55
