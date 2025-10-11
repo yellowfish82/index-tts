@@ -685,7 +685,7 @@ class IndexTTS2:
                     if torch.cuda.is_available():
                         total_mem = torch.cuda.get_device_properties(0).total_memory / (1024**3)
                         if total_mem < 10:
-                            diffusion_steps = 15  # 减少步数以降低峰值内存
+                            diffusion_steps = 19  # 减少步数以降低峰值内存
                         else:
                             diffusion_steps = 25
                     else:
